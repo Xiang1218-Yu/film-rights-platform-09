@@ -1,13 +1,15 @@
+// 预算 / 合同 / 项目域。资产版本谱系在 lineage.ts，审批与审计账本在 approval.ts；
+// 本模块只保留财务侧聚合，并把资产、冲突等视图委托给谱系模型（始终指向具体版本）。
 export type ProjectStatus = 'development' | 'production' | 'post' | 'delivered';
-export type AssetType = 'master' | 'trailer' | 'poster' | 'audio' | 'subtitle';
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
+
+import { approvals, createApproval, decideApproval, recordAudit, type ApprovalStatus } from './approval.js';
+import { projectAssets, rightsConflicts, ledgerState } from './lineage.js';
+
+export { approvals, createApproval };
 
 export interface Project { id: string; code: string; title: string; season: number; status: ProjectStatus; currency: string; budgetVersionId: string; deliveryDate: string; }
 export interface BudgetLine { id: string; projectId: string; category: string; subcategory: string; planned: number; committed: number; actual: number; forecast: number; owner: string; risk: 'low' | 'medium' | 'high'; }
 export interface Contract { id: string; projectId: string; vendor: string; scope: string; ceiling: number; committed: number; paid: number; milestones: { name: string; due: string; amount: number; status: 'open' | 'invoiced' | 'paid' }[]; }
-export interface Asset { id: string; projectId: string; name: string; type: AssetType; version: number; status: 'draft' | 'review' | 'approved' | 'locked'; owner: string; checksum: string; territories: string[]; platforms: string[]; availableFrom: string; availableTo: string; rightsTags: string[]; }
-export interface Approval { id: string; projectId: string; entityType: 'budget' | 'asset' | 'delivery'; entityId: string; title: string; requestedBy: string; status: ApprovalStatus; approver: string; createdAt: string; comment?: string; }
-export interface AuditEvent { id: string; action: string; entity: string; entityId: string; actor: string; at: string; details: string; }
 
 const now = Date.now();
 const iso = (days: number) => new Date(now + days * 86400000).toISOString().slice(0, 10);
@@ -28,45 +30,70 @@ export const contracts: Contract[] = [
   { id: 'CTR-02', projectId: 'PRJ-001', vendor: '远景国际版权', scope: '北美与欧洲音乐同步许可', ceiling: 880000, committed: 880000, paid: 440000, milestones: [{ name: '签署', due: iso(-16), amount: 440000, status: 'paid' }, { name: '交付版权证明', due: iso(4), amount: 440000, status: 'invoiced' }] },
   { id: 'CTR-03', projectId: 'PRJ-002', vendor: '云帧视觉', scope: '纪录片航拍与卫星素材', ceiling: 1600000, committed: 1100000, paid: 600000, milestones: [{ name: '素材包一', due: iso(20), amount: 500000, status: 'open' }] }
 ];
-export const assets: Asset[] = [
-  { id: 'AST-001', projectId: 'PRJ-001', name: '北境回声 S01E01 4K HDR Master', type: 'master', version: 7, status: 'review', owner: '后期制片', checksum: 'sha256:91b7…e2a1', territories: ['CN', 'HK', 'SG'], platforms: ['影院', 'StreamBox'], availableFrom: iso(-2), availableTo: iso(730), rightsTags: ['音乐-同步许可', '演员-全媒介'] },
-  { id: 'AST-002', projectId: 'PRJ-001', name: '主预告 90s / Cut A', type: 'trailer', version: 4, status: 'approved', owner: '营销部', checksum: 'sha256:42ca…9b02', territories: ['CN'], platforms: ['StreamBox', '短视频'], availableFrom: iso(6), availableTo: iso(180), rightsTags: ['演员-宣传许可'] },
-  { id: 'AST-003', projectId: 'PRJ-001', name: '片尾曲 / Winter Signal', type: 'audio', version: 2, status: 'locked', owner: '音乐版权', checksum: 'sha256:113c…78f0', territories: ['CN', 'US', 'CA'], platforms: ['影院', 'StreamBox'], availableFrom: iso(-40), availableTo: iso(52), rightsTags: ['音乐-同步许可'] },
-  { id: 'AST-004', projectId: 'PRJ-002', name: 'Orbit E02 Satellite Plates', type: 'master', version: 3, status: 'review', owner: '视觉总监', checksum: 'sha256:8a10…4a9d', territories: ['全球'], platforms: ['影院'], availableFrom: iso(18), availableTo: iso(365), rightsTags: ['航拍-编辑许可'] }
-];
-export const approvals: Approval[] = [
-  { id: 'APR-01', projectId: 'PRJ-001', entityType: 'budget', entityId: 'BUD-001-V3', title: '后期超支预案 V3', requestedBy: '制片主任', status: 'pending', approver: '财务负责人', createdAt: iso(-1) },
-  { id: 'APR-02', projectId: 'PRJ-001', entityType: 'asset', entityId: 'AST-001', title: 'E01 最终母版锁定', requestedBy: '后期制片', status: 'pending', approver: '总制片人', createdAt: iso(-2) },
-  { id: 'APR-03', projectId: 'PRJ-002', entityType: 'delivery', entityId: 'DEL-007', title: '海外节展交付包', requestedBy: '发行部', status: 'approved', approver: '法务负责人', createdAt: iso(-5), comment: '已补充航拍授权凭证' }
-];
-export const auditEvents: AuditEvent[] = [{ id: 'AUD-01', action: 'CREATE', entity: 'budget', entityId: 'BUD-001-V3', actor: '制片主任', at: new Date(now - 86400000).toISOString(), details: '从 V2 复制并调整后期科目' }];
+
+/** 预算等非版本实体的审批决议；资产版本审批必须走 lineage.applyApprovalDecision。 */
+export function approve(id: string, status: ApprovalStatus, comment = '') {
+  const approval = approvals.find(item => item.id === id);
+  if (!approval) return undefined;
+  if (approval.entityType !== 'budget') {
+    throw new Error('该审批由版本谱系流程处理');
+  }
+  return decideApproval(id, status, comment);
+}
 
 export function projectSummary(projectId = projects[0].id) {
   const lines = budgetLines.filter(line => line.projectId === projectId);
   const projectContracts = contracts.filter(contract => contract.projectId === projectId);
-  const projectAssets = assets.filter(asset => asset.projectId === projectId);
+  const assets = projectAssets(projectId);
   const projectApprovals = approvals.filter(approval => approval.projectId === projectId);
   const planned = lines.reduce((sum, line) => sum + line.planned, 0);
   const forecast = lines.reduce((sum, line) => sum + line.forecast, 0);
   const actual = lines.reduce((sum, line) => sum + line.actual, 0);
-  return { project: projects.find(project => project.id === projectId), planned, forecast, actual, variance: forecast - planned, utilization: planned ? actual / planned : 0, committed: lines.reduce((sum, line) => sum + line.committed, 0), contractExposure: projectContracts.reduce((sum, contract) => sum + contract.ceiling, 0), assetCount: projectAssets.length, pendingApprovals: projectApprovals.filter(item => item.status === 'pending').length, highRiskLines: lines.filter(line => line.risk === 'high'), lines, contracts: projectContracts, assets: projectAssets, approvals: projectApprovals };
+  return {
+    project: projects.find(project => project.id === projectId),
+    planned, forecast, actual,
+    variance: forecast - planned,
+    utilization: planned ? actual / planned : 0,
+    committed: lines.reduce((sum, line) => sum + line.committed, 0),
+    contractExposure: projectContracts.reduce((sum, contract) => sum + contract.ceiling, 0),
+    assetCount: new Set(assets.map(asset => asset.lineageId)).size,
+    pendingApprovals: projectApprovals.filter(item => item.status === 'pending').length,
+    highRiskLines: lines.filter(line => line.risk === 'high'),
+    lines,
+    contracts: projectContracts,
+    assets,
+    approvals: projectApprovals,
+    ledger: ledgerState(),
+  };
 }
 
-export function rightsConflicts(projectId = projects[0].id) {
-  const list = assets.filter(asset => asset.projectId === projectId);
-  const conflicts: { severity: 'critical' | 'warning'; assetA: string; assetB: string; reason: string }[] = [];
-  for (let i = 0; i < list.length; i += 1) for (let j = i + 1; j < list.length; j += 1) {
-    const a = list[i], b = list[j];
-    const sameTag = a.rightsTags.some(tag => b.rightsTags.includes(tag));
-    const sameTerritory = a.territories.includes('全球') || b.territories.includes('全球') || a.territories.some(territory => b.territories.includes(territory));
-    if (sameTag && sameTerritory && a.availableTo >= b.availableFrom && b.availableTo >= a.availableFrom) conflicts.push({ severity: a.status === 'locked' || b.status === 'locked' ? 'critical' : 'warning', assetA: a.name, assetB: b.name, reason: `同一授权标签在重叠窗口内覆盖相同地域：${a.rightsTags.filter(tag => b.rightsTags.includes(tag)).join('、')}` });
+export { rightsConflicts, ledgerState };
+
+export function dashboard() {
+  return projects.map(project => projectSummary(project.id)).map(summary => ({
+    id: summary.project?.id,
+    title: summary.project?.title,
+    status: summary.project?.status,
+    forecast: summary.forecast,
+    variance: summary.variance,
+    pendingApprovals: summary.pendingApprovals,
+    rightsConflicts: rightsConflicts(summary.project?.id ?? '').length,
+    ledgerRevision: summary.ledger.revision,
+  }));
+}
+
+// 种子审批（在谱系种子之后登记，使审计顺序可读）。
+let seeded = false;
+export function seedApprovals(): void {
+  if (seeded) return;
+  seeded = true;
+  recordAudit({ action: 'CREATE', entity: 'budget', entityId: 'BUD-001-V3', actor: '制片主任', details: '从 V2 复制并调整后期科目' });
+  createApproval({ projectId: 'PRJ-001', entityType: 'budget', entityId: 'BUD-001-V3', title: '后期超支预案 V3', requestedBy: '制片主任', approver: '财务负责人' });
+  createApproval({ projectId: 'PRJ-001', entityType: 'assetVersion', entityId: 'AST-001-V7', title: '北境回声 E01 最终母版 v7 送审', requestedBy: '后期制片', approver: '总制片人', action: 'submit' });
+  createApproval({ projectId: 'PRJ-002', entityType: 'delivery', entityId: 'DLV-007', title: '海外节展交付包', requestedBy: '发行部', approver: '法务负责人' });
+  // 海外节展包审批标记为通过（其预检在谱系种子中已完成）。
+  const deliveryApproval = approvals.find(a => a.entityId === 'DLV-007');
+  if (deliveryApproval) {
+    decideApproval(deliveryApproval.id, 'approved', '已补充航拍授权凭证');
   }
-  return conflicts;
 }
-
-export function approve(id: string, status: ApprovalStatus, comment = '') {
-  const item = approvals.find(approval => approval.id === id); if (!item) return undefined;
-  item.status = status; item.comment = comment; auditEvents.unshift({ id: `AUD-${Date.now()}`, action: status.toUpperCase(), entity: item.entityType, entityId: item.entityId, actor: '当前审批人', at: new Date().toISOString(), details: comment || `${item.title} 已${status === 'approved' ? '通过' : '驳回'}` }); return item;
-}
-export function createApproval(input: Pick<Approval, 'projectId' | 'entityType' | 'entityId' | 'title' | 'requestedBy' | 'approver'>) { const item: Approval = { ...input, id: `APR-${Date.now()}`, status: 'pending', createdAt: new Date().toISOString() }; approvals.unshift(item); return item; }
-export function dashboard() { return projects.map(project => projectSummary(project.id)).map(summary => ({ id: summary.project?.id, title: summary.project?.title, status: summary.project?.status, forecast: summary.forecast, variance: summary.variance, pendingApprovals: summary.pendingApprovals, rightsConflicts: rightsConflicts(summary.project?.id).length })); }
